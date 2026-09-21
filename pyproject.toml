@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dsh-openai-shim"
+version = "0.2.0"
+description = "Zero-dependency OpenAI-compatible proxy that adapts DeepSeek Harness (dsh) to any OpenAI-compatible endpoint (Socrates/LiteLLM/sglang/vLLM)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "dive4dec"}]
+keywords = ["openai", "proxy", "deepseek", "harness", "dsh", "sglang", "vllm", "litellm", "reasoning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+dsh-openai-shim = "dsh_openai_shim.cli:main"
+dsh-proxy = "dsh_openai_shim.proxy_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dsh_openai_shim"]
+
+[project.urls]
+Homepage = "https://github.com/dive4dec/dsh-openai-shim"
+"Source Code" = "https://github.com/dive4dec/dsh-openai-shim"
