@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dsh-openai-shim"
-version = "0.2.0"
+version = "0.2.1"
 description = "Zero-dependency OpenAI-compatible proxy that adapts DeepSeek Harness (dsh) to any OpenAI-compatible endpoint (Socrates/LiteLLM/sglang/vLLM)"
 readme = "README.md"
 requires-python = ">=3.10"

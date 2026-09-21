@@ -3,6 +3,43 @@
 All notable changes to the `dsh-openai-shim` package are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] — 2026-09-22
+
+### Added
+- **`dsh-proxy ensure`** — the single in-pod startup orchestrator. It syncs the
+  deployment's `DIVEAI_*`/`LITELLM_*` entries into `~/.dsh/proxy.conf`, then
+  starts the daemon if it is down or restarts it if the sync changed anything
+  (unchanged + already running → no-op). The image's `40-dsh-proxy` boot hook now
+  calls this ONE command instead of a hand-rolled bash sync+start, and the
+  duplicated copy that lived in the hub values files' `jupyter_server_config`
+  has been removed.
+- **`dsh-proxy seed-settings`** — seeds `~/.dsh/settings.yaml` on first boot by
+  DISCOVERING the model name and its `contextWindow` from the deployment
+  provider's `/v1/models` (the same way hermes does) instead of the image
+  baking a fixed model name + `contextWindow`. The model is deployment policy
+  (`DSH_DEFAULT_MODEL` env; unset → first advertised model); the window is
+  omitted rather than fabricated when undiscoverable. Seeded only when the file
+  is absent (student edits survive). Also adds `discover_model_ids()` and
+  `discover_model_context_window()` to the discovery module (shared
+  `_fetch_models()` fetch, no duplicated HTTP).
+
+### Changed
+- **First-run default provider is now deployment policy, not a hardcoded value.**
+  `ensure`/`sync` read it from the `DSH_PROXY_DEFAULT_PROVIDER` env var
+  (unset → nothing forced; the student keeps/picks their own). The old
+  `--default-provider litellm` that was baked into the image is gone, so the
+  same image can serve clusters whose default dsh provider is not litellm.
+  (A `--default-provider` flag remains on both commands for tests/overrides.)
+
+### Tests
+- Added coverage for `ensure`: env-driven first-run default, the
+  no-hardcoded-default regression (provider stays `None` when the env is unset),
+  idempotent re-run (no stop/start), and student-choice preservation.
+- Added coverage for `seed-settings`: discovers model name + `contextWindow`
+  from the endpoint, honors `DSH_DEFAULT_MODEL`, never clobbers an existing
+  `settings.yaml`, skips (no fabricated file) when no model can be determined,
+  and a regression asserting the package contains no baked model name or window.
+
 ## [0.2.0] — 2026-09-21
 
 ### Added

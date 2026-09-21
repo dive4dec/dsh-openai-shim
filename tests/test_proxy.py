@@ -14,7 +14,8 @@ from dsh_openai_shim.config import load_config, ProxyConfig, save_config
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for var in ("DIVEAI_API_BASE", "DIVEAI_API_KEY", "LITELLM_API_BASE",
-                "LITELLM_API_KEY", "DSH_PROXY_DEFAULT_PROVIDER"):
+                "LITELLM_API_KEY", "DSH_PROXY_DEFAULT_PROVIDER",
+                "DSH_DEFAULT_MODEL", "DSH_REASONING_EFFORT"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -204,6 +205,220 @@ def test_sync_no_deployment_vars_is_noop(tmp_path, monkeypatch, capsys):
     assert main("sync", "--default-provider", "litellm") == 0
     assert "changed=no" in capsys.readouterr().out
     assert load_config().providers == {}
+
+
+# ─────────────────────────────────────────────────────────────
+# ensure: the single in-pod startup orchestrator (sync + start/restart)
+#
+# This is the ONLY place the sync+daemon logic lives — the image's 40-dsh-proxy
+# boot hook calls `dsh-proxy ensure`, and the values files no longer carry a
+# copy. The first-run default provider comes from the DSH_PROXY_DEFAULT_PROVIDER
+# env (deployment policy); the package hardcodes NO provider.
+# ─────────────────────────────────────────────────────────────
+
+def _deployment_env(monkeypatch):
+    monkeypatch.setenv("DIVEAI_API_BASE", "https://dive.cs.example/ai/v1")
+    monkeypatch.setenv("DIVEAI_API_KEY", "dkey")
+    monkeypatch.setenv("LITELLM_API_BASE", "https://socratic.cs.example/litellm/v1")
+    monkeypatch.setenv("LITELLM_API_KEY", "lkey")
+
+
+def test_ensure_starts_daemon_and_uses_env_default(tmp_path, monkeypatch, capsys):
+    """First run: sync entries + apply the DSH_PROXY_DEFAULT_PROVIDER env + start."""
+    from dsh_openai_shim import proxy_cli
+    cap = {"start": 0, "stop": 0, "running": False}
+    monkeypatch.setattr(proxy_cli, "is_shim_running", lambda port=None: cap["running"])
+    monkeypatch.setattr(proxy_cli, "start_shim_detached",
+                        lambda port=None, wait_seconds=15.0: cap.update(start=cap["start"] + 1) or True)
+    monkeypatch.setattr(proxy_cli, "stop_shim", lambda port=None, timeout=5.0: cap.update(stop=cap["stop"] + 1) or True)
+    monkeypatch.setattr(proxy_cli, "_upstream_for",
+                        lambda cfg: ("http://u", "k", None, None, ""))
+
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    _deployment_env(monkeypatch)
+    monkeypatch.setenv("DSH_PROXY_DEFAULT_PROVIDER", "litellm")
+
+    assert main("ensure") == 0
+    assert "ensure ok" in capsys.readouterr().out
+    assert cap["start"] == 1 and cap["stop"] == 0  # started, no prior daemon to stop
+    cfg = load_config()
+    assert cfg.provider == "litellm"  # from the ENV, not any hardcoded value
+    assert set(cfg.providers) == {"diveai", "litellm"}
+
+
+def test_ensure_no_hardcoded_default(tmp_path, monkeypatch, capsys):
+    """Regression: with DSH_PROXY_DEFAULT_PROVIDER unset, ensure must force
+    NO provider. A baked-in default (e.g. the old `--default-provider litellm`)
+    would select one here and fail this test."""
+    from dsh_openai_shim import proxy_cli
+    monkeypatch.setattr(proxy_cli, "is_shim_running", lambda port=None: False)
+    monkeypatch.setattr(proxy_cli, "start_shim_detached",
+                        lambda port=None, wait_seconds=15.0: True)
+    monkeypatch.setattr(proxy_cli, "stop_shim", lambda port=None, timeout=5.0: True)
+    monkeypatch.setattr(proxy_cli, "_upstream_for",
+                        lambda cfg: ("http://u", "k", None, None, ""))
+
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    _deployment_env(monkeypatch)
+    # DSH_PROXY_DEFAULT_PROVIDER is already unset (autouse _clean_env)
+
+    assert main("ensure") == 0
+    err = capsys.readouterr().err
+    assert load_config().provider is None  # NOTHING forced — deployment-agnostic
+    assert "no provider selected yet" in err
+
+
+def test_ensure_idempotent_leaves_running_daemon(tmp_path, monkeypatch):
+    """After the daemon is up, an unchanged re-run is a no-op (no stop, no start)."""
+    from dsh_openai_shim import proxy_cli
+    cap = {"start": 0, "stop": 0, "running": False}
+    monkeypatch.setattr(proxy_cli, "is_shim_running", lambda port=None: cap["running"])
+    monkeypatch.setattr(proxy_cli, "start_shim_detached",
+                        lambda port=None, wait_seconds=15.0:
+                        cap.update(start=cap["start"] + 1, running=True) or True)
+    monkeypatch.setattr(proxy_cli, "stop_shim",
+                        lambda port=None, timeout=5.0:
+                        cap.update(stop=cap["stop"] + 1, running=False) or True)
+    monkeypatch.setattr(proxy_cli, "_upstream_for",
+                        lambda cfg: ("http://u", "k", None, None, ""))
+
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    _deployment_env(monkeypatch)
+    main("ensure", "--default-provider", "litellm")  # run 1: changed -> start
+    assert cap["start"] == 1 and cap["running"] is True
+    main("ensure", "--default-provider", "litellm")  # run 2: unchanged + running -> no-op
+    assert cap["start"] == 1 and cap["stop"] == 0  # left running, untouched
+
+
+def test_ensure_preserves_student_choice(tmp_path, monkeypatch):
+    """A student's selected provider survives ensure even with an env default."""
+    from dsh_openai_shim import proxy_cli
+    monkeypatch.setattr(proxy_cli, "is_shim_running", lambda port=None: False)
+    monkeypatch.setattr(proxy_cli, "start_shim_detached",
+                        lambda port=None, wait_seconds=15.0: True)
+    monkeypatch.setattr(proxy_cli, "stop_shim", lambda port=None, timeout=5.0: True)
+    monkeypatch.setattr(proxy_cli, "_upstream_for",
+                        lambda cfg: ("http://u", "k", None, None, ""))
+
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    save_config(ProxyConfig(provider="myprov",
+                            providers={"myprov": {"base_url": "https://mine.example/v1",
+                                                  "api_key": "mk"}}))
+    _deployment_env(monkeypatch)
+    monkeypatch.setenv("DSH_PROXY_DEFAULT_PROVIDER", "litellm")
+    assert main("ensure") == 0
+    cfg = load_config()
+    assert cfg.provider == "myprov"  # never clobbered
+    assert "litellm" in cfg.providers  # deployment entry still synced in
+
+
+# ─────────────────────────────────────────────────────────────
+# seed-settings: first-boot dsh settings.yaml — DISCOVER, don't hardcode
+#
+# The old boot hook baked model name ("Socrates") AND contextWindow (262144)
+# into the image. Now `dsh-proxy seed-settings` discovers both from the
+# endpoint's /v1/models (the same way hermes does). The deployment policy
+# model is DSH_DEFAULT_MODEL (env); unset → first advertised model. No model
+# name or window is baked into the package — this section is the regression
+# guard for that.
+# ─────────────────────────────────────────────────────────────
+
+def _seed_models_server():
+    """Local upstream serving GET /v1/models; returns (up, base_url, port)."""
+    from test_discover import ModelsUpstream, _free_port
+    port = _free_port()
+    payload = {"object": "list", "data": [
+        {"id": "Socrates", "object": "model", "owned_by": "litellm",
+         "max_model_len": 262144},
+        {"id": "OtherModel", "object": "model", "max_model_len": 64000},
+    ]}
+    up = ModelsUpstream(port, payload)
+    return up, f"http://127.0.0.1:{port}/v1", port
+
+
+def test_seed_discovers_model_and_context_window(tmp_path, monkeypatch, capsys):
+    """No DSH_DEFAULT_MODEL: first advertised model + discovered contextWindow."""
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    up, base, _port = _seed_models_server()
+    try:
+        # add the deployment provider pointing at the local models server
+        assert main("use", "litellm", "--base", base, "--key", "lkey") == 0
+        assert main("seed-settings") == 0
+        p = tmp_path / "settings.yaml"
+        assert p.exists()
+        text = p.read_text()
+        # discovered the first advertised model (Socrates is listed first)
+        assert "model: Socrates" in text
+        # discovered contextWindow from max_model_len (NOT a baked constant)
+        assert "contextWindow: 262144" in text
+        # provider routing constant is present (dsh→shim protocol name)
+        assert "provider: deepseek-official" in text
+        assert "reasoningEffort: high" in text
+    finally:
+        up.stop()
+
+
+def test_seed_uses_dsh_default_model_env(tmp_path, monkeypatch, capsys):
+    """DSH_DEFAULT_MODEL (deployment policy) wins over the first advertised."""
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    up, base, _port = _seed_models_server()
+    monkeypatch.setenv("DSH_DEFAULT_MODEL", "OtherModel")
+    try:
+        assert main("use", "litellm", "--base", base, "--key", "lkey") == 0
+        assert main("seed-settings") == 0
+        text = (tmp_path / "settings.yaml").read_text()
+        assert "model: OtherModel" in text
+        # still discovered the window for that model
+        assert "contextWindow: 64000" in text
+    finally:
+        up.stop()
+
+
+def test_seed_does_not_clobber_existing_settings(tmp_path, monkeypatch, capsys):
+    """A student's edited settings.yaml is never overwritten by the seed."""
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    p = tmp_path / "settings.yaml"
+    p.write_text("agent-default-model:\n  provider: deepseek-official\n"
+                 "  model: StudentChose\n  reasoningEffort: low\n")
+    up, base, _port = _seed_models_server()
+    try:
+        assert main("use", "litellm", "--base", base, "--key", "lkey") == 0
+        assert main("seed-settings") == 0
+        text = p.read_text()
+        assert "model: StudentChose" in text          # untouched
+        assert "model: Socrates" not in text           # not re-seeded
+    finally:
+        up.stop()
+
+
+def test_seed_no_model_determined_skips(tmp_path, monkeypatch, capsys):
+    """Unreachable endpoint + no DSH_DEFAULT_MODEL → skip (no fabricated file).
+
+    A skip is BENIGN (best-effort; the student just picks a model), so the
+    exit code is 0 — not a warning that would alarm the boot hook.
+    """
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    # provider points at a dead port so discovery finds no models
+    assert main("use", "litellm", "--base", "http://127.0.0.1:1/v1",
+                "--key", "lkey", "--no-discover") == 0
+    assert main("seed-settings") == 0          # benign skip, not a failure
+    assert not (tmp_path / "settings.yaml").exists()
+    assert "no model name could be determined" in capsys.readouterr().err
+
+
+def test_seed_settings_no_hardcoded_name_regression():
+    """The package contains NO baked model name or window literal.
+
+    Guards the whole point of moving the seed out of the image: the shim must
+    derive model + contextWindow from the endpoint (or the env), never from a
+    hardcoded default.
+    """
+    import dsh_openai_shim.proxy_cli as pc
+    import inspect
+    src = inspect.getsource(pc)
+    # "Socrates" and the old baked window must not appear as literals in the CLI
+    assert '"Socrates"' not in src and "'Socrates'" not in src
+    assert "262144" not in src
 
 
 # ─────────────────────────────────────────────────────────────

@@ -44,6 +44,8 @@ from typing import Optional
 __all__ = [
     "discover_completion_cap",
     "discover_model_limits",
+    "discover_model_ids",
+    "discover_model_context_window",
     "parse_completion_cap_from_error",
     "parse_context_window_error",
     "is_output_cap_error",
@@ -90,6 +92,81 @@ def _cap(cand: Optional[int]) -> Optional[int]:
     return None
 
 
+def _fetch_models(base_url: str, api_key: str = "", timeout: int = 8) -> Optional[list]:
+    """Return the ``data`` list from ``GET {base}/v1/models``, or ``None``.
+
+    Shared by the limit probes and :func:`discover_model_ids`. Tries both
+    ``…/v1`` and bare-host forms (same candidates ``discover_model_limits``
+    uses). Stdlib-only so it runs inside the dependency-free shim.
+    """
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return None
+    candidates = []
+    if base.endswith("/v1"):
+        candidates += [base, base[:-3]]
+    else:
+        candidates += [base + "/v1", base]
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    for c in candidates:
+        url = c.rstrip("/") + "/models"
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            payload = json.loads(raw.decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            continue
+        models = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(models, list) and models:
+            return models
+    return None
+
+
+def discover_model_ids(
+    base_url: str,
+    api_key: str = "",
+    timeout: int = 8,
+) -> list:
+    """Return the list of model ``id`` strings the endpoint advertises.
+
+    ``[]`` when the endpoint can't be reached or reports none (the caller then
+    falls back to its configured default and lets the student pick). Preserves
+    the server's ordering (the first entry is the deployment's primary model).
+    """
+    models = _fetch_models(base_url, api_key=api_key, timeout=timeout)
+    if not models:
+        return []
+    ids = [m.get("id") for m in models if isinstance(m, dict) and m.get("id")]
+    return [str(i) for i in ids if i]
+
+
+def discover_model_context_window(
+    base_url: str,
+    model_id: str,
+    api_key: str = "",
+    timeout: int = 8,
+) -> Optional[int]:
+    """The context window the endpoint reports for ONE specific model id.
+
+    Unlike :func:`discover_model_limits` (which returns the min across all
+    models for a safe clamping bound), this looks up ``model_id`` in
+    ``/v1/models`` and returns that model's ``max_model_len`` /
+    ``max_context_length`` / … — the value that belongs in dsh's catalog entry
+    for that model. ``None`` when the endpoint is unreachable or the model
+    doesn't report a window (caller omits the field; the shim self-heals it
+    later from the first context-length 400).
+    """
+    models = _fetch_models(base_url, api_key=api_key, timeout=timeout)
+    if not models:
+        return None
+    for m in models:
+        if isinstance(m, dict) and m.get("id") == model_id:
+            return _cap(_extract_first_int(m, _CONTEXT_KEYS))
+    return None
+
+
 def discover_model_limits(
     base_url: str,
     api_key: str = "",
@@ -110,45 +187,26 @@ def discover_model_limits(
 
     ``base_url`` may carry a trailing ``/v1`` or not; both forms are tried.
     """
-    base = (base_url or "").strip().rstrip("/")
-    if not base:
+    models = _fetch_models(base_url, api_key=api_key, timeout=timeout)
+    if not models:
         return None, None
-    candidates = []
-    if base.endswith("/v1"):
-        candidates += [base, base[:-3]]
-    else:
-        candidates += [base + "/v1", base]
-
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    for c in candidates:
-        url = c.rstrip("/") + "/models"
-        try:
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-            payload = json.loads(raw.decode("utf-8", "replace"))
-        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
-            continue
-        models = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(models, list) or not models:
-            continue
-        # 1) an explicit completion/output cap wins outright.
-        for m in models:
-            completion = _cap(_extract_first_int(m, _COMPLETION_KEYS))
-            if completion is not None:
-                ctx = _cap(_extract_first_int(m, _CONTEXT_KEYS))
-                if ctx is None:
-                    ctx = completion
-                return completion, ctx
-        # 2) else the context window IS the safe bound for both.
-        contexts: list[int] = []
-        for m in models:
+    # 1) an explicit completion/output cap wins outright.
+    for m in models:
+        completion = _cap(_extract_first_int(m, _COMPLETION_KEYS))
+        if completion is not None:
             ctx = _cap(_extract_first_int(m, _CONTEXT_KEYS))
-            if ctx is not None:
-                contexts.append(ctx)
-        if contexts:
-            win = min(contexts)
-            return win, win
+            if ctx is None:
+                ctx = completion
+            return completion, ctx
+    # 2) else the context window IS the safe bound for both.
+    contexts: list[int] = []
+    for m in models:
+        ctx = _cap(_extract_first_int(m, _CONTEXT_KEYS))
+        if ctx is not None:
+            contexts.append(ctx)
+    if contexts:
+        win = min(contexts)
+        return win, win
     return None, None
 
 
