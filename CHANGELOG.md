@@ -3,6 +3,36 @@
 All notable changes to the `dsh-openai-shim` package are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] — 2026-09-23
+
+### Fixed
+- **Mid-stream cut no longer kills the shim (the dsh "TRANSPORT" bug).** The
+  forward handler buffered the entire upstream response with `raw = resp.read()`
+  *outside* any try/except. When the upstream (e.g. an ingress severing a long
+  SSE stream) cut the connection mid-body, the `IncompleteRead` /
+  `ConnectionResetError` propagated out of the handler thread — killing the
+  thread and the whole shim — so the dsh client saw a raw connection close and
+  surfaced a bare `TRANSPORT` failure. A mid-stream cut now emits a clean
+  terminal SSE event (`data: [ERROR] upstream stream interrupted`) and the shim
+  stays up to serve the next request.
+
+### Changed
+- **SSE responses stream live instead of being buffered.** Stream requests are
+  now forwarded chunk-by-chunk with `resp.fp.read1(4096)` (one socket read,
+  returns as soon as any byte is available) rather than `resp.read()` (waits for
+  the whole body). The dsh UI sees tokens as they generate; a stalling client
+  can no longer wedge the upstream socket buffer. Stream responses are framed
+  with `Connection: close` so the client gets a definite end-of-stream.
+- **Pre-response transport failure retries once, then a clean 502.** A
+  connection-level failure before any upstream byte (dead upstream, connect
+  error, buffered read that died pre-response) is a safe full-request resend
+  (the shim is stateless). After one retry it returns a clean `502` instead of
+  a raw close. This composes with the existing context-window / output-cap
+  self-heal retry.
+
+Upstream routing is unchanged — this release only makes the shim resilient to a
+cut and streams live; it does not alter which backend the requests reach.
+
 ## [0.2.1] — 2026-09-22
 
 ### Added

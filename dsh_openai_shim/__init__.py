@@ -11,14 +11,16 @@ No third-party dependencies. Importable for unit testing; runnable standalone.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = ["__version__", "ShimConfig", "apply_rewrites", "make_handler", "serve",
            "ensure_shim", "shim_base_url", "is_shim_running", "DEFAULT_SHIM_PORT"]
@@ -263,6 +265,11 @@ def _filter_headers(headers: Any, strip: set[str]) -> dict[str, str]:
     return out
 
 
+class _ClientGone(Exception):
+    """The client hung up mid-response — stop streaming; this is NOT an upstream
+    failure. Raised by the streaming write helper and caught by the stream loop."""
+
+
 def make_handler(cfg: ShimConfig):
     """Build ``(HandlerClass, ThreadingHTTPServer)`` bound to ``cfg``."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -283,24 +290,122 @@ def make_handler(cfg: ShimConfig):
                     self.send_header(k, v)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            self._write_safe(raw)
+
+        def _write_safe(self, data: bytes) -> None:
+            """Write to the client; a client that hung up must not kill the
+            handler thread (a dead thread takes the whole shim down)."""
+            try:
+                self.wfile.write(data)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                self.close_connection = True
 
         def _send_error(self, code: int, raw: bytes) -> None:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            self._write_safe(raw)
+
+        def _send_502(self, why: str) -> None:
+            msg = json.dumps(
+                {"error": {"message": f"shim upstream error: {why}", "code": 502}}
+            ).encode()
+            self._send_error(502, msg)
+
+        def _write_stream_chunk(self, data: bytes) -> None:
+            """Forward one upstream chunk to the client immediately (flushed, so
+            dsh sees tokens live instead of after the whole generation). A client
+            that disconnects raises _ClientGone so the read loop can stop."""
+            try:
+                self.wfile.write(data)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                self.close_connection = True
+                raise _ClientGone()
+
+        def _stream_upstream(self, resp) -> None:
+            """SSE pass-through: send the upstream's 2xx headers, then pipe each
+            chunk to the client as it arrives.
+
+            A mid-stream cut can no longer be a 502 — we already sent 200 — so
+            we emit a terminal SSE event and close cleanly. The client sees a
+            clean end to the stream instead of a raw connection close.
+
+            The body is forwarded with ``resp.fp.read1(4096)``: that does ONE
+            underlying socket read and returns as soon as ANY data is available
+            (it does NOT wait to fill 4096). ``resp.read(4096)`` would instead
+            block until the buffer is full, batching the whole generation and
+            only delivering it at the end — which defeats live streaming. A
+            bounded per-read flush also keeps a stalling client from wedging
+            the upstream socket buffer.
+            """
+            self.send_response(resp.status)
+            for k, v in resp.headers.items():
+                lk = k.lower()
+                # Re-frame the body: never forward the upstream's framing headers
+                # (content-length / transfer-encoding) or hop-by-hop headers.
+                if lk in _STRIP_RES_HEADERS or lk in ("content-length",
+                                                       "transfer-encoding"):
+                    continue
+                self.send_header(k, v)
+            self.send_header("X-Accel-Buffering", "no")  # tell any proxy: don't buffer SSE
+            # The streamed body has no Content-Length and we do not add chunked
+            # framing, so the ONLY way the client knows the response is complete
+            # is the connection closing. Signal + enforce that, or the client
+            # (dsh/undici) will sit on the keep-alive connection waiting for a
+            # terminator that never comes and time out mid-stream.
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            try:
+                while True:
+                    try:
+                        chunk = resp.fp.read1(4096)
+                    except http.client.IncompleteRead as ir:
+                        # Upstream severed the stream mid-body (declared more
+                        # data than it actually sent). Forward whatever it
+                        # managed to send, then emit a clean terminal event.
+                        got = ir.partial or b""
+                        if got:
+                            self._write_stream_chunk(got)
+                        print(f"[shim {cfg.listen_port}] upstream stream cut mid-response "
+                              f"(IncompleteRead, {len(got)}b received)", flush=True)
+                        self._write_stream_chunk(
+                            b'data: [ERROR] upstream stream interrupted\n\n')
+                        break
+                    if not chunk:
+                        break  # clean EOF — upstream finished the stream
+                    self._write_stream_chunk(chunk)
+            except _ClientGone:
+                pass  # client went away — stop, nothing to log
+            except (http.client.IncompleteRead, urllib.error.URLError,
+                    socket.timeout, ConnectionError, OSError) as e:
+                # Upstream cut the stream mid-body (ConnectionResetError for a
+                # TCP RST, IncompleteRead for a truncated body) — the root
+                # cause of the dsh "TRANSPORT" errors. Emit a clean terminal
+                # event instead of letting the exception kill the handler.
+                print(f"[shim {cfg.listen_port}] upstream stream cut mid-response: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                try:
+                    self._write_stream_chunk(
+                        b'data: [ERROR] upstream stream interrupted\n\n')
+                except _ClientGone:
+                    pass
 
         def _do_forward_once(self, method: str, url: str, headers: dict,
-                             data: Optional[bytes]):
+                             data: Optional[bytes], stream: bool = False):
             """Send one upstream attempt.
 
-            Returns ``None`` once a response has been written to the client
-            (a success, or a network/502 failure — both terminal). Returns
-            ``(code, raw)`` when the upstream answered with an HTTP error that
-            has NOT yet been sent to the client — so the caller can either
-            self-heal (lower the cap and retry) or forward the error.
+            Returns ``None`` once a response has been written to the client (a
+            success — buffered or streamed — or a terminal error). Otherwise it
+            returns a tag the caller can act on:
+              * ``("http", code, raw)``   — upstream answered with an HTTP error
+                that has NOT yet been sent (caller may self-heal and retry).
+              * ``("transport", err)``    — a pre-response transport failure
+                (connect error, or a buffered read that died before any client
+                byte). Nothing was sent, so the caller may retry the request.
             """
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
@@ -309,14 +414,22 @@ def make_handler(cfg: ShimConfig):
                 raw = e.read()
                 print(f"[shim {cfg.listen_port}] upstream HTTP {e.code}: {raw[:200]!r}",
                       flush=True)
-                return e.code, raw
+                return ("http", e.code, raw)
             except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
-                msg = json.dumps(
-                    {"error": {"message": f"shim upstream error: {e}", "code": 502}}
-                ).encode()
-                self._send_error(502, msg)
+                return ("transport", e)
+            if stream:
+                self._stream_upstream(resp)
                 return None
-            raw = resp.read()
+            # Non-stream: buffer the whole body, but GUARD the read. The old
+            # code had `raw = resp.read()` outside any try, so a mid-read cut
+            # raised IncompleteRead out of the handler and killed the thread.
+            try:
+                raw = resp.read()
+            except (http.client.IncompleteRead, urllib.error.URLError,
+                    socket.timeout, ConnectionError, OSError) as e:
+                print(f"[shim {cfg.listen_port}] upstream read failed pre-response: {e}",
+                      flush=True)
+                return ("transport", e)
             self._send_success(resp, raw)
             return None
 
@@ -326,15 +439,22 @@ def make_handler(cfg: ShimConfig):
             if cfg.upstream_key:
                 headers["Authorization"] = f"Bearer {cfg.upstream_key}"
             data: Optional[bytes] = None
+            stream = False
             if method == "POST" and body is not None:
                 data = body
+                try:
+                    stream = bool(json.loads(body).get("stream"))
+                except (ValueError, UnicodeDecodeError):
+                    stream = False
             elif method != "POST":
-                # GET/HEAD/OPTIONS — no self-heal, one shot.
-                outcome = self._do_forward_once(method, url, headers, None)
+                # GET/HEAD/OPTIONS — no self-heal, one shot, never streamed.
+                outcome = self._do_forward_once(method, url, headers, None, stream=False)
                 if outcome is None:
                     return
-                code, raw = outcome
-                self._send_error(code, raw)
+                if outcome[0] == "http":
+                    self._send_error(outcome[1], outcome[2])
+                else:
+                    self._send_502(str(outcome[1]))
                 return
 
             orig_body = data
@@ -355,10 +475,22 @@ def make_handler(cfg: ShimConfig):
                     pass
                 h = dict(headers)
                 h["Content-Length"] = str(len(rewritten))
-                outcome = self._do_forward_once("POST", url, h, rewritten)
+                outcome = self._do_forward_once("POST", url, h, rewritten, stream=stream)
                 if outcome is None:
-                    return  # a client response was written (success / 502)
-                code, raw = outcome
+                    return  # a client response was written (success / stream)
+                if outcome[0] == "transport":
+                    # Pre-response transport failure: nothing reached the client,
+                    # so a full-request resend is safe. Retry once with backoff;
+                    # if that also fails, emit a clean 502.
+                    if attempt == 1:
+                        print(f"[shim {cfg.listen_port}] upstream transport error, "
+                              f"retrying once: {outcome[1]}", flush=True)
+                        time.sleep(1.0)
+                        continue
+                    self._send_502(str(outcome[1]))
+                    return
+                # outcome == ("http", code, raw)
+                code, raw = outcome[1], outcome[2]
                 if attempt == 1:
                     # --- Self-heal (hermes-style), two distinct error forms ---
                     # 1) CONTEXT-WINDOW: "…exceeds the model's maximum context
