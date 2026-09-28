@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 __all__ = ["__version__", "ShimConfig", "apply_rewrites", "make_handler", "serve",
            "ensure_shim", "shim_base_url", "is_shim_running", "DEFAULT_SHIM_PORT"]
@@ -270,6 +270,98 @@ class _ClientGone(Exception):
     failure. Raised by the streaming write helper and caught by the stream loop."""
 
 
+class _SSEMessageStartDedup:
+    """Re-emit upstream SSE bytes event-by-event, dropping a duplicate
+    ``message_start`` that repeats the first one's message id.
+
+    LiteLLM's Anthropic ``/v1/messages`` adapter emits TWO ``message_start``
+    events for a single message; dsh 0.2.0-rc.1's Anthropic client rejects the
+    duplicate with ``MALFORMED_RESPONSE`` (``duplicate message_start``). A
+    well-formed Messages stream has exactly ONE ``message_start``, so dropping
+    the repeat is a no-op for the protocol — the stream is otherwise forwarded
+    byte-identical.
+
+    The class buffers raw bytes and returns COMPLETE events (terminated by a
+    blank ``\\n\\n`` line) so the caller can forward each one as soon as it
+    arrives, keeping the stream live. Only the trailing incomplete event is
+    held back; ``flush()`` releases it at stream end.
+
+    The filter is unconditional and safe for any stream: a normal OpenAI stream
+    has no ``event: message_start`` lines (no-op), and a correct single-start
+    Anthropic stream passes through unchanged.
+    """
+
+    __slots__ = ("_buf", "_seen", "_seen_id")
+
+    def __init__(self) -> None:
+        self._buf = b""
+        self._seen = False            # a message_start has been forwarded
+        self._seen_id: Optional[str] = None
+
+    @staticmethod
+    def _start_id(event: bytes) -> Optional[str]:
+        for line in event.split(b"\n"):
+            s = line.strip()
+            if s.startswith(b"data:"):
+                try:
+                    obj = json.loads(s[5:].decode("utf-8", "replace"))
+                except (ValueError, UnicodeDecodeError):
+                    return None
+                if isinstance(obj, dict):
+                    m = obj.get("message")
+                    if isinstance(m, dict) and isinstance(m.get("id"), str):
+                        return m["id"]
+        return None
+
+    def _is_dup_start(self, event: bytes) -> bool:
+        if not self._is_event_start(event) or not self._seen:
+            return False
+        mid = self._start_id(event)
+        if self._seen_id is None or mid is None:
+            return True               # can't confirm a distinct message — be safe
+        return mid == self._seen_id
+
+    @staticmethod
+    def _is_event_start(event: bytes) -> bool:
+        """True if this SSE event is a ``message_start``.
+
+        Match the ``event: message_start`` LINE anywhere in the event, NOT
+        position 0: the upstream is ``Transfer-Encoding: chunked`` and the shim
+        reads the raw wire (``resp.fp.read1``), so the FIRST event arrives with a
+        hex chunk-size line glued to its front (``2be\\r\\nevent: message_start…``)
+        and does NOT begin with ``event:``. (dsh's SSE parser ignores that bare
+        hex line — it's not an ``event:/data:`` field — so the stream still
+        works; we only need to *recognize* the start for dedup.)"""
+        for line in event.split(b"\n"):
+            if line.strip() == b"event: message_start":
+                return True
+        return False
+
+    def feed(self, chunk: bytes) -> list:
+        """Append ``chunk``; return the list of complete events to forward
+        (duplicate ``message_start``s already dropped). The incomplete tail stays
+        held back until it completes or ``flush()`` is called at stream end."""
+        self._buf += chunk
+        out: list = []
+        while True:
+            idx = self._buf.find(b"\n\n")
+            if idx == -1:
+                break
+            event = self._buf[: idx + 2]
+            if not self._is_dup_start(event):
+                if self._is_event_start(event):
+                    self._seen = True
+                    self._seen_id = self._start_id(event)
+                out.append(event)
+            self._buf = self._buf[idx + 2:]
+        return out
+
+    def flush(self) -> bytes:
+        """Release any held-back incomplete tail as-is (stream-end leftover)."""
+        tail, self._buf = self._buf, b""
+        return tail
+
+
 def make_handler(cfg: ShimConfig):
     """Build ``(HandlerClass, ThreadingHTTPServer)`` bound to ``cfg``."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -359,6 +451,25 @@ def make_handler(cfg: ShimConfig):
             self.send_header("Connection", "close")
             self.close_connection = True
             self.end_headers()
+            # Route every upstream chunk through the message_start dedup filter.
+            # It forwards complete events as they arrive (stream stays live) and
+            # drops a duplicate message_start; the trailing incomplete event is
+            # held back and released on flush() at stream end / cut.
+            dedup = _SSEMessageStartDedup()
+
+            def _emit(seq) -> None:
+                for ev in seq:
+                    self._write_stream_chunk(ev)
+
+            def _push(chunk: bytes) -> None:
+                if chunk:
+                    _emit(dedup.feed(chunk))
+
+            def _flush_tail() -> None:
+                tail = dedup.flush()
+                if tail:
+                    _emit([tail])
+
             try:
                 while True:
                     try:
@@ -368,16 +479,17 @@ def make_handler(cfg: ShimConfig):
                         # data than it actually sent). Forward whatever it
                         # managed to send, then emit a clean terminal event.
                         got = ir.partial or b""
-                        if got:
-                            self._write_stream_chunk(got)
                         print(f"[shim {cfg.listen_port}] upstream stream cut mid-response "
                               f"(IncompleteRead, {len(got)}b received)", flush=True)
+                        if got:
+                            _push(got)
+                        _flush_tail()
                         self._write_stream_chunk(
                             b'data: [ERROR] upstream stream interrupted\n\n')
                         break
                     if not chunk:
                         break  # clean EOF — upstream finished the stream
-                    self._write_stream_chunk(chunk)
+                    _push(chunk)
             except _ClientGone:
                 pass  # client went away — stop, nothing to log
             except (http.client.IncompleteRead, urllib.error.URLError,
@@ -389,10 +501,13 @@ def make_handler(cfg: ShimConfig):
                 print(f"[shim {cfg.listen_port}] upstream stream cut mid-response: "
                       f"{type(e).__name__}: {e}", flush=True)
                 try:
+                    _flush_tail()
                     self._write_stream_chunk(
                         b'data: [ERROR] upstream stream interrupted\n\n')
                 except _ClientGone:
                     pass
+            else:
+                _flush_tail()  # clean EOF: release any held-back tail
 
         def _do_forward_once(self, method: str, url: str, headers: dict,
                              data: Optional[bytes], stream: bool = False):

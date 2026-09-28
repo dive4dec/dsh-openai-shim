@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from dsh_openai_shim import ShimConfig, apply_rewrites, make_handler
+from dsh_openai_shim import _SSEMessageStartDedup
 
 
 # ─────────────────────────────────────────────────────────────
@@ -526,3 +527,174 @@ def test_prebyte_transport_error_retries_once_then_502():
         assert code == 502
     finally:
         httpd.server_close()
+
+
+# ─────────────────────────────────────────────────────────────
+# message_start dedup — the dsh 0.2.0-rc.1 / LiteLLM fix
+# ─────────────────────────────────────────────────────────────
+
+# A LiteLLM-shaped Anthropic stream: TWO message_start (same id), a thinking
+# block, text, message_delta, message_stop. This is the exact upstream shape
+# that dsh 0.2.0-rc.1 rejects with "duplicate message_start / MALFORMED_RESPONSE".
+def _messages_stream(events, dup_start=True):
+    start = (b'event: message_start\n'
+             b'data: {"type":"message_start","message":{"id":"msg_abc",'
+             b'"role":"assistant","model":"Socrates"}}\n\n')
+    evs = [start]
+    if dup_start:
+        evs.append(start)  # the bug: LiteLLM emits it twice
+    evs += [
+        b'event: content_block_start\n'
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"thinking","thinking":""}}\n\n',
+        b'event: content_block_delta\n'
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"thinking_delta","thinking":"hello"}}\n\n',
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta","stop_reason":"end_turn"}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    if events is not None:
+        evs = events
+    return b"".join(evs)
+
+
+def test_dedup_unit_drops_same_id_start():
+    d = _SSEMessageStartDedup()
+    out = b"".join(d.feed(_messages_stream(None))) + d.flush()
+    assert out.count(b"event: message_start") == 1   # 2 upstream -> 1 forwarded
+    # every other event survives, byte-identical, in order
+    for needle in (b"content_block_start", b"thinking_delta",
+                   b"content_block_stop", b"message_delta", b"message_stop"):
+        assert needle in out
+    # the original (first) message_start payload is preserved
+    assert b'"id":"msg_abc"' in out
+
+
+def test_dedup_unit_keeps_distinct_id_start():
+    # Two DIFFERENT message ids must BOTH be forwarded (a legit multi-message
+    # stream, or the first id unparseable -> we must not drop real content).
+    a = (b'event: message_start\n'
+         b'data: {"type":"message_start","message":{"id":"msg_1"}}\n\n')
+    b = (b'event: message_start\n'
+         b'data: {"type":"message_start","message":{"id":"msg_2"}}\n\n')
+    d = _SSEMessageStartDedup()
+    out = b"".join(d.feed(a + b)) + d.flush()
+    assert out.count(b"event: message_start") == 2
+    assert b"msg_1" in out and b"msg_2" in out
+
+
+def test_dedup_unit_openai_stream_is_noop():
+    # A normal OpenAI stream has no "event: message_start" lines -> unchanged.
+    evs = (b'data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}\n\n'
+           b'data: [DONE]\n\n')
+    d = _SSEMessageStartDedup()
+    out = b"".join(d.feed(evs)) + d.flush()
+    assert out == evs
+
+
+def test_dedup_unit_split_across_chunks():
+    # The duplicate start's "\n\n" terminator may land in a different TCP chunk
+    # than its body (or the event itself is split mid-line). The filter must
+    # still recognize + drop it and not corrupt the following event.
+    stream = _messages_stream(None)
+    d = _SSEMessageStartDedup()
+    out = b""
+    for i in range(0, len(stream), 3):        # 3-byte dribble = worst-case splits
+        out += b"".join(d.feed(stream[i:i + 3]))
+    out += d.flush()
+    assert out.count(b"event: message_start") == 1
+    assert b"message_stop" in out
+
+
+def _make_fake_messages_upstream(port):
+    """Raw-socket upstream that, for /messages, emits the LiteLLM-shaped
+    DUPLICATE message_start stream (dripped), then EOF."""
+    def _serve_conn(c):
+        try:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(65536)
+                if not d:
+                    return
+                buf += d
+            head, _, body = buf.partition(b"\r\n\r\n")
+            n = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    n = int(line.split(b":", 1)[1])
+            while len(body) < n:
+                d = c.recv(65536)
+                if not d:
+                    break
+                body += d
+            c.sendall(b"HTTP/1.1 200 OK\r\n"
+                      b"Content-Type: text/event-stream\r\n\r\n")
+            for ev in _messages_stream(None).split(b"\n\n"):
+                if ev:
+                    c.sendall(ev + b"\n\n")
+                    time.sleep(0.03)
+            c.close()
+        except OSError:
+            pass
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(16)
+
+    def _accept_loop():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=_serve_conn, args=(c,), daemon=True).start()
+
+    threading.Thread(target=_accept_loop, daemon=True).start()
+    return SimpleNamespace(stop=srv.close)
+
+
+def test_sse_duplicate_message_start_is_dropped_end_to_end():
+    """The production failure, end to end: an upstream that emits two
+    message_start (same id) must reach the client as ONE, with the rest of the
+    stream intact and still streaming live."""
+    up_port = _free_port()
+    up = _make_fake_messages_upstream(up_port)
+    httpd, base, _port = _inproc_shim(f"http://127.0.0.1:{up_port}")
+    try:
+        body = json.dumps({"model": "Socrates", "stream": True,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        data, first, status = _stream_request(base, "/messages", body, 10)
+        assert status == 200
+        text = data.decode("utf-8", "replace")
+        # THE POINT: exactly one message_start event survives the shim
+        assert text.count("event: message_start") == 1
+        # the rest of the stream is intact and in order
+        assert "content_block_delta" in text and "thinking_delta" in text
+        assert "message_delta" in text and "message_stop" in text
+        # and it still streamed live (first byte well before the end)
+        assert first is not None and first < 0.3
+    finally:
+        httpd.server_close()
+        up.stop()
+
+
+def test_dedup_unit_chunked_wire_prefix_first_event():
+    # THE REAL LITELLM SHAPE: the stream is Transfer-Encoding: chunked and the
+    # shim reads the raw wire, so the FIRST message_start event arrives with a
+    # hex chunk-size line (b"2be\r\n" = 666) glued to its front, while the
+    # DUPLICATE second start is clean. The filter must still drop the duplicate
+    # even though the first event does not begin with "event:".
+    chunked_first = (b"2be\r\n"
+                     b"event: message_start\n"
+                     b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_chunked\"}}\n\n")
+    clean_second = (b"event: message_start\n"
+                    b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_chunked\"}}\n\n")
+    rest = (b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\"}\n\n"
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+    d = _SSEMessageStartDedup()
+    out = b"".join(d.feed(chunked_first + clean_second + rest)) + d.flush()
+    assert out.count(b"event: message_start") == 1   # 2 upstream -> 1 forwarded
+    assert b"content_block_stop" in out and b"message_stop" in out
+    assert b"msg_chunked" in out
