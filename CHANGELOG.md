@@ -3,6 +3,36 @@
 All notable changes to the `dsh-openai-shim` package are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.4] — 2026-09-29
+
+### Fixed
+- **dsh fails on non-litellm providers with `thinking: Value error,
+  thinking.budget_tokens is required when thinking.type is 'enabled'`.**
+  Not a provider bug in the shim — the shim never reads or writes the
+  Anthropic `thinking` field (the only `litellm` references in the package
+  are a doc comment and a provider *label* used when seeding `proxy.conf`).
+  The cause: dsh 0.2.0-rc.1 sends `thinking: {type: "enabled"}` (no budget)
+  for every provider, and the backends disagree — litellm's Anthropic adapter
+  accepts it, `ai-test` (socratic) requires `budget_tokens`, and spark's model
+  has no reasoning parser and rejects `thinking` entirely. The shim now
+  **self-heals** the way it already does for `max_tokens`: on a 400 whose
+  error is about the `thinking` field, it strips the field and retries once.
+  This makes socratic and spark work while leaving litellm untouched, and it
+  is generic (any future backend that rejects thinking) rather than a
+  per-provider special case. Verified in-pod against the real spark (400 →
+  retry without `thinking` → 200, self-heal logged) and socratic (200).
+
+## [0.2.3] — 2026-09-29
+
+### Fixed
+- **Duplicate `message_start` in the Anthropic `/v1/messages` stream → dsh
+  `MALFORMED_RESPONSE: duplicate message_start`.** LiteLLM emits two
+  `message_start` SSE events (same id) per message. The shim's forward path
+  now de-dupes them, dropping a repeated start that shares its id. The
+  detector matches the `event: message_start` *line* anywhere in the event —
+  not at position 0 — because the stream is `Transfer-Encoding: chunked` and
+  the first event arrives with a hex chunk-size line glued to its front.
+
 ## [0.2.2] — 2026-09-23
 
 ### Fixed

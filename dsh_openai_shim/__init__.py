@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 __all__ = ["__version__", "ShimConfig", "apply_rewrites", "make_handler", "serve",
            "ensure_shim", "shim_base_url", "is_shim_running", "DEFAULT_SHIM_PORT"]
@@ -74,12 +74,19 @@ class ShimConfig:
 
 
 def apply_rewrites(body: Optional[bytes], cfg: ShimConfig,
-                   force_max_tokens: Optional[int] = None) -> tuple[bytes, list[str]]:
+                   force_max_tokens: Optional[int] = None,
+                   drop_thinking: bool = False) -> tuple[bytes, list[str]]:
     """Apply the shim's rewrites to a request body.
 
     ``force_max_tokens`` (set only by the self-heal retry) pins ``max_tokens``
     to an exact value — the window minus the upstream's reported input count —
     overriding the usual cap/window clamp for that one attempt.
+
+    ``drop_thinking`` (set only by the self-heal retry) removes the Anthropic
+    ``thinking`` field entirely. Some backends reject extended-thinking
+    requests (one requires ``budget_tokens`` when ``type`` is ``"enabled"``;
+    another has no reasoning parser at all), so on that 400 the retry strips
+    the field and resends a plain message.
 
     Returns ``(new_body, changes)``. Bodies that are not JSON objects pass
     through untouched.
@@ -105,6 +112,15 @@ def apply_rewrites(body: Optional[bytes], cfg: ShimConfig,
             if new is not None and new != val:
                 data["reasoning_effort"] = new
                 changes.append(f"reasoning_effort {val!r}->{new!r}")
+
+    # --- thinking drop (self-heal only) -----------------------------------
+    # A backend that can't handle extended thinking 400s on the ``thinking``
+    # field. On that error the retry strips it and resends a plain message —
+    # the model still answers, just without a reasoning trace. Only fires when
+    # a request actually carries the field, so ordinary requests are untouched.
+    if drop_thinking and "thinking" in data:
+        del data["thinking"]
+        changes.append("dropped thinking (upstream rejected extended thinking)")
 
     # --- max_tokens clamp ---------------------------------------------------
     # Keep the client's explicit max_tokens when it is already small (a short
@@ -220,6 +236,41 @@ def _parse_context_error(raw: bytes) -> tuple:
         return (None, None, None)
     from .discover import parse_context_window_error
     return parse_context_window_error(message)
+
+
+def _is_thinking_error(raw: bytes) -> bool:
+    """True when the upstream rejected the request because of the Anthropic
+    ``thinking`` field.
+
+    Two observed forms (both from strict backends, while lenient ones pass the
+    same body through):
+      * ``"thinking.budget_tokens is required when thinking.type is 'enabled'"``
+        — extended thinking needs an explicit budget.
+      * ``"Anthropic thinking is not supported for models without a
+        reasoning parser"`` — the model can't do extended thinking at all.
+    Matching on the ``thinking`` keyword in the message is enough: it is the
+    field we would drop, so a retry without it is the correct response.
+    """
+    message = _error_message(raw)
+    if not message:
+        return False
+    m = message.lower()
+    if "thinking" not in m:
+        return False
+    # Narrow to errors that are actually about the thinking field, so an
+    # unrelated error that merely mentions "thinking" in prose isn't retried.
+    return any(
+        k in m
+        for k in (
+            "budget_tokens",
+            "budget",
+            "reasoning parser",
+            "thinking.type",
+            "invalid_request",
+            "unsupported",
+            "not supported",
+        )
+    )
 
 
 def _persist_provider_cap(name: Optional[str], cap, context_window=None) -> None:
@@ -576,9 +627,13 @@ def make_handler(cfg: ShimConfig):
             # When set (by the self-heal on the first attempt), the retry pins
             # max_tokens to this exact value instead of the usual clamp.
             retry_force: Optional[int] = None
+            # When set (by the thinking self-heal on the first attempt), the
+            # retry strips the ``thinking`` field before resending.
+            drop_thinking = False
             for attempt in (1, 2):
                 rewritten, changes = apply_rewrites(
-                    orig_body, cfg, force_max_tokens=retry_force)
+                    orig_body, cfg, force_max_tokens=retry_force,
+                    drop_thinking=drop_thinking)
                 for c in changes:
                     print(f"[shim {cfg.listen_port}] rewrite: {c}", flush=True)
                 # log the model field (helps debug which model reached upstream)
@@ -641,6 +696,21 @@ def make_handler(cfg: ShimConfig):
                               flush=True)
                         _persist_provider_cap(cfg.provider_name, cfg.token_cap)
                         continue
+                    # 3) EXTENDED-THINKING: upstream rejects the ``thinking``
+                    #    field (budget required / no reasoning parser). The
+                    #    model still answers a plain message — only the
+                    #    reasoning trace is lost. Strip the field and retry once.
+                    if _is_thinking_error(raw):
+                        try:
+                            _had_thinking = "thinking" in json.loads(rewritten)
+                        except (ValueError, UnicodeDecodeError):
+                            _had_thinking = False
+                        if _had_thinking:
+                            drop_thinking = True
+                            print(f"[shim {cfg.listen_port}] self-heal: upstream "
+                                  "rejected extended thinking -> retry without "
+                                  "the thinking field", flush=True)
+                            continue
                 self._send_error(code, raw)
                 return
 

@@ -9,6 +9,7 @@ import pytest
 
 from dsh_openai_shim import ShimConfig, apply_rewrites, make_handler
 from dsh_openai_shim import _SSEMessageStartDedup
+from dsh_openai_shim import _is_thinking_error, _error_message
 
 
 # ─────────────────────────────────────────────────────────────
@@ -698,3 +699,115 @@ def test_dedup_unit_chunked_wire_prefix_first_event():
     assert out.count(b"event: message_start") == 1   # 2 upstream -> 1 forwarded
     assert b"content_block_stop" in out and b"message_stop" in out
     assert b"msg_chunked" in out
+
+
+# ─────────────────────────────────────────────────────────────
+# Extended-thinking self-heal (dsh sends thinking:{type:enabled}; strict
+# backends 400 on it → shim strips the field and retries once)
+# ─────────────────────────────────────────────────────────────
+
+def _thinking_err(message: str) -> bytes:
+    return json.dumps({"type": "error", "error": {
+        "type": "invalid_request_error", "message": message}}).encode()
+
+
+def test_is_thinking_error_budget_required():
+    # The socratic/ai-test form, captured verbatim from the live 400.
+    assert _is_thinking_error(_thinking_err(
+        "thinking: Value error, thinking.budget_tokens is required "
+        "when thinking.type is 'enabled'"))
+
+
+def test_is_thinking_error_no_reasoning_parser():
+    # The spark form, captured verbatim from the live 400.
+    assert _is_thinking_error(_thinking_err(
+        "Anthropic thinking is not supported for models without a reasoning parser"))
+
+
+def test_is_thinking_error_ignores_unrelated():
+    assert not _is_thinking_error(_thinking_err("max_tokens is too large"))
+    assert not _is_thinking_error(_thinking_err("not a json body"))
+    assert not _is_thinking_error(b"")
+    # an unrelated error that merely MENTIONS thinking in prose is not matched
+    assert not _is_thinking_error(_thinking_err(
+        "provider did not accept the request"))
+
+
+def test_apply_rewrites_drop_thinking():
+    body = json.dumps({"model": "Socrates", "thinking": {"type": "enabled"},
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    # not dropped by default
+    new, changes = apply_rewrites(body, _cfg(effort_mode="off"), drop_thinking=False)
+    assert "thinking" in json.loads(new)
+    # dropped when asked
+    new, changes = apply_rewrites(body, _cfg(effort_mode="off"), drop_thinking=True)
+    out = json.loads(new)
+    assert "thinking" not in out
+    assert any("thinking" in c for c in changes)
+    # a body with NO thinking field is untouched (no spurious change) —
+    # token_cap=0 disables the max_tokens clamp so the only possible change
+    # would be a spurious one from the thinking drop itself.
+    plain = json.dumps({"model": "Socrates",
+                        "messages": [{"role": "user", "content": "hi"}]}).encode()
+    new2, changes2 = apply_rewrites(plain, _cfg(effort_mode="off", token_cap=0),
+                                    drop_thinking=True)
+    assert new2 == plain and changes2 == []
+
+
+def test_end_to_end_thinking_self_heal_retries_and_drops():
+    """End to end: upstream rejects thinking:{type:enabled} with the budget
+    400, the shim retries WITHOUT the thinking field, and the client gets a
+    clean 200. Mirrors the real socratic/ai-test failure."""
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+        seen = []
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(n))
+            H.seen.append(body)
+            if "thinking" in body:
+                raw = _thinking_err(
+                    "thinking: Value error, thinking.budget_tokens is required "
+                    "when thinking.type is 'enabled'")
+                self.send_response(400)
+            else:
+                raw = json.dumps({"id": "x", "type": "message", "content":
+                    [{"type": "text", "text": "pong"}]}).encode()
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    up_port = _free_port(); shim_port = _free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", up_port), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        cfg = ShimConfig(upstream=f"http://127.0.0.1:{up_port}/v1",
+                         listen_port=shim_port, effort_mode="off", token_cap=100000)
+        Handler, ThreadingHTTPServer = make_handler(cfg)
+        shttpd = ThreadingHTTPServer(("127.0.0.1", shim_port), Handler)
+        threading.Thread(target=shttpd.serve_forever, daemon=True).start()
+        try:
+            body = json.dumps({"model": "Socrates", "thinking": {"type": "enabled"},
+                               "max_tokens": 1024,
+                               "messages": [{"role": "user", "content": "hi"}]}).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{shim_port}/v1/messages",
+                data=body, headers={"Authorization": "Bearer k",
+                                    "Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                assert r.status == 200
+                out = json.loads(r.read())
+            assert out["content"][0]["text"] == "pong"
+            # two upstream hits: first WITH thinking (400), second WITHOUT (200)
+            assert len(H.seen) == 2
+            assert "thinking" in H.seen[0]
+            assert "thinking" not in H.seen[1]
+        finally:
+            shttpd.server_close()
+    finally:
+        httpd.server_close()
