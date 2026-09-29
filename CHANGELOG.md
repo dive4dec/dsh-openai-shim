@@ -3,6 +3,38 @@
 All notable changes to the `dsh-openai-shim` package are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.5] — 2026-09-29
+
+### Fixed
+- **Completed the non-litellm dsh fix that 0.2.4 only half-finished.** 0.2.4's
+  single self-heal dropped the `thinking` field, but the *retry* still failed on
+  two backends, because the shim's retry loop applied only **one** self-heal per
+  request and two further problems remained:
+  - **socratic (`ai-test`)** still 500'd (opaque "Internal server error") on
+    dsh's nonstandard `output_config: {effort: "high"}` field (added by dsh's
+    `pi-ai` layer). Bisected in-pod: dropping *only* `output_config` → 200.
+  - **spark (64k window)** overflowed its context: dsh set `max_tokens` from its
+    own (under-) input estimate, and the shim's proactive clamp over-saw the
+    input because its estimator counted **only `messages`** (~145 tok) instead of
+    the full prompt (`messages` + `system` + **24 tool definitions** ≈ 5068 tok).
+    `input + max_tokens` then exceeded the 64000 window.
+  
+  Three changes:
+  1. **`output_config` self-heal** — on a 500 *with* the field in the request,
+     drop it and retry (a genuine 500 without the field is NOT masked).
+  2. **Stacking retry loop** — up to 3 attempts; each self-heal (context-window,
+     output-cap, thinking, output_config) is idempotent and can fire, so a single
+     request can accumulate the multiple adaptations it needs (e.g. drop thinking
+     *and* re-clamp max_tokens *and* drop output_config).
+  3. **Full-input estimator** — counts `messages` + `system` + `tools` (not just
+     `messages`), so the proactive `max_tokens` clamp sets a safe value on the
+     *first* request and small-window backends don't overflow. Overestimating
+     input is safe (it only lowers `max_tokens`).
+  
+  Verified in-pod against all three real backends (a real `dsh headless` turn
+  each): spark (short + long prompt) and socratic now answer cleanly; litellm
+  unchanged (200). 99 tests pass (3 new).
+
 ## [0.2.4] — 2026-09-29
 
 ### Fixed

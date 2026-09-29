@@ -811,3 +811,89 @@ def test_end_to_end_thinking_self_heal_retries_and_drops():
             shttpd.server_close()
     finally:
         httpd.server_close()
+
+
+def test_apply_rewrites_drop_output_config():
+    body = json.dumps({"model": "m", "output_config": {"effort": "high"},
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    # not dropped by default
+    new, _ = apply_rewrites(body, _cfg(effort_mode="off"), drop_output_config=False)
+    assert "output_config" in json.loads(new)
+    # dropped when asked
+    new, changes = apply_rewrites(body, _cfg(effort_mode="off"), drop_output_config=True)
+    assert "output_config" not in json.loads(new)
+    assert any("output_config" in c for c in changes)
+    # no field -> untouched (token_cap=0 disables the clamp)
+    plain = json.dumps({"model": "m",
+                        "messages": [{"role": "user", "content": "hi"}]}).encode()
+    new2, changes2 = apply_rewrites(plain, _cfg(effort_mode="off", token_cap=0),
+                                    drop_output_config=True)
+    assert new2 == plain and changes2 == []
+
+
+def test_end_to_end_stacked_self_heal_thinking_then_output_config():
+    """End to end: a strict backend 400s on ``thinking`` AND 500s on
+    ``output_config``. The single request must stack BOTH self-heals (drop
+    thinking, then drop output_config) and reach a clean 200. Mirrors the real
+    socratic/ai-test failure, where the first (thinking) fix alone was not
+    enough — the retry still 500'd on output_config."""
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    _oc = json.dumps({"type": "error", "error": {"type": "api_error",
+                  "message": "Internal server error"}}).encode()
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+        seen = []
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(n))
+            H.seen.append(body)
+            if "thinking" in body:
+                raw = _thinking_err(
+                    "thinking: Value error, thinking.budget_tokens is required "
+                    "when thinking.type is 'enabled'")
+                self.send_response(400)
+            elif "output_config" in body:
+                raw = _oc
+                self.send_response(500)
+            else:
+                raw = json.dumps({"id": "x", "type": "message", "content":
+                    [{"type": "text", "text": "pong"}]}).encode()
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    up_port = _free_port(); shim_port = _free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", up_port), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        cfg = ShimConfig(upstream=f"http://127.0.0.1:{up_port}/v1",
+                         listen_port=shim_port, effort_mode="off", token_cap=100000)
+        Handler, ThreadingHTTPServer = make_handler(cfg)
+        shttpd = ThreadingHTTPServer(("127.0.0.1", shim_port), Handler)
+        threading.Thread(target=shttpd.serve_forever, daemon=True).start()
+        try:
+            body = json.dumps({"model": "Socrates", "thinking": {"type": "enabled"},
+                               "output_config": {"effort": "high"}, "max_tokens": 1024,
+                               "messages": [{"role": "user", "content": "hi"}]}).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{shim_port}/v1/messages",
+                data=body, headers={"Authorization": "Bearer k",
+                                    "Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                assert r.status == 200
+                out = json.loads(r.read())
+            assert out["content"][0]["text"] == "pong"
+            # THREE upstream hits: thinking+oc (400) -> oc (500) -> neither (200)
+            assert len(H.seen) == 3, f"expected 3 attempts, got {len(H.seen)}"
+            assert "thinking" in H.seen[0] and "output_config" in H.seen[0]
+            assert "thinking" not in H.seen[1] and "output_config" in H.seen[1]
+            assert "thinking" not in H.seen[2] and "output_config" not in H.seen[2]
+        finally:
+            shttpd.server_close()
+    finally:
+        httpd.server_close()

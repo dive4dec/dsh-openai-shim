@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 __all__ = ["__version__", "ShimConfig", "apply_rewrites", "make_handler", "serve",
            "ensure_shim", "shim_base_url", "is_shim_running", "DEFAULT_SHIM_PORT"]
@@ -75,7 +75,8 @@ class ShimConfig:
 
 def apply_rewrites(body: Optional[bytes], cfg: ShimConfig,
                    force_max_tokens: Optional[int] = None,
-                   drop_thinking: bool = False) -> tuple[bytes, list[str]]:
+                   drop_thinking: bool = False,
+                   drop_output_config: bool = False) -> tuple[bytes, list[str]]:
     """Apply the shim's rewrites to a request body.
 
     ``force_max_tokens`` (set only by the self-heal retry) pins ``max_tokens``
@@ -87,6 +88,13 @@ def apply_rewrites(body: Optional[bytes], cfg: ShimConfig,
     requests (one requires ``budget_tokens`` when ``type`` is ``"enabled"``;
     another has no reasoning parser at all), so on that 400 the retry strips
     the field and resends a plain message.
+
+    ``drop_output_config`` (set only by the self-heal retry) removes the
+    nonstandard ``output_config`` field (added by dsh's ``pi-ai`` layer, e.g.
+    ``{"effort": "high"}``). One backend 500s (opaque "Internal server error")
+    whenever it is present — dropping it restores a clean 200 — so on a 500
+    with the field in the request the retry strips it. Only fires when the
+    request actually carries the field, so ordinary requests are untouched.
 
     Returns ``(new_body, changes)``. Bodies that are not JSON objects pass
     through untouched.
@@ -122,6 +130,13 @@ def apply_rewrites(body: Optional[bytes], cfg: ShimConfig,
         del data["thinking"]
         changes.append("dropped thinking (upstream rejected extended thinking)")
 
+    # --- output_config drop (self-heal only) ------------------------------
+    # A nonstandard field dsh's pi-ai layer adds (e.g. {"effort":"high"}); one
+    # backend 500s on it. On that error the retry strips it and resends.
+    if drop_output_config and "output_config" in data:
+        del data["output_config"]
+        changes.append("dropped output_config (upstream 500'd on it)")
+
     # --- max_tokens clamp ---------------------------------------------------
     # Keep the client's explicit max_tokens when it is already small (a short
     # answer is fine for a small cap); only OVERRIDE it when it would overflow
@@ -137,32 +152,38 @@ def apply_rewrites(body: Optional[bytes], cfg: ShimConfig,
     return (json.dumps(data).encode("utf-8"), changes)
 
 
-def _estimate_input_tokens(content) -> int:
-    """Rough input-token estimate from a chat request's ``messages`` field.
+def _estimate_input_tokens(data) -> int:
+    """Rough input-token estimate from a chat request's FULL input.
 
-    No tokenizer is available in a stdlib-only shim, so this counts characters
-    across all message content and divides by ~4 (an English token is ~3.5-4
-    chars). The estimate only needs to be *close* — it drives the proactive
-    clamp, and the self-heal (which reads the server's EXACT input count from
-    its error) corrects any misestimate on the retry. Slightly-overestimating
-    is safe (it only makes the request more conservative, never less).
+    The server's "input tokens" is the model's entire prompt: the chat
+    ``messages`` PLUS the ``system`` prompt PLUS every ``tool`` definition.
+    dsh sends ~24 tools (thousands of tokens) — an estimate that counts only
+    ``messages`` is far too small, which makes the proactive ``max_tokens``
+    clamp too generous and overflows small-window backends (spark: 5068 real
+    input vs ~145 estimated → ``input + max_tokens > window`` → 400). No
+    tokenizer is available in a stdlib-only shim, so we count the serialized
+    character length of each input field and divide by ~4 (an English token is
+    ~3.5-4 chars). Overestimating is safe: it only LOWERS ``max_tokens`` (more
+    conservative), never raises it.
+
+    Accepts the whole request dict (counts ``messages`` + ``system`` +
+    ``tools``); for backward compatibility a bare ``messages`` list is also
+    accepted.
     """
+    if isinstance(data, dict):
+        parts = [data.get(k) for k in ("messages", "system", "tools")]
+    elif isinstance(data, list):  # legacy caller passed just the messages list
+        parts = [data]
+    else:
+        parts = []
     chars = 0
-
-    def _count(c) -> None:
-        nonlocal chars
-        if isinstance(c, str):
-            chars += len(c)
-        elif isinstance(c, list):
-            for part in c:
-                if isinstance(part, str):
-                    chars += len(part)
-                elif isinstance(part, dict) and isinstance(part.get("text"), str):
-                    chars += len(part["text"])
-
-    for msg in content if isinstance(content, list) else []:
-        if isinstance(msg, dict):
-            _count(msg.get("content"))
+    for p in parts:
+        if p is None:
+            continue
+        try:
+            chars += len(json.dumps(p))
+        except (ValueError, TypeError):
+            chars += len(str(p))
     return max(1, chars // 4)
 
 
@@ -188,7 +209,7 @@ def _clamp_max_tokens(data: dict, cfg: "ShimConfig",
     cap = cfg.token_cap
     if not isinstance(cap, int) or cap <= 0:
         return None
-    est = _estimate_input_tokens(data.get("messages"))
+    est = _estimate_input_tokens(data)
     eff = cap
     if isinstance(cfg.context_window, int) and cfg.context_window > 0:
         headroom = cfg.context_window - est - 128
@@ -624,16 +645,21 @@ def make_handler(cfg: ShimConfig):
                 return
 
             orig_body = data
-            # When set (by the self-heal on the first attempt), the retry pins
-            # max_tokens to this exact value instead of the usual clamp.
-            retry_force: Optional[int] = None
-            # When set (by the thinking self-heal on the first attempt), the
-            # retry strips the ``thinking`` field before resending.
-            drop_thinking = False
-            for attempt in (1, 2):
+            # Accumulated self-heal state. A single request may need MORE THAN
+            # ONE adaptation before the upstream accepts it — e.g. a strict
+            # backend 400s on ``thinking`` AND the prompt overflows the context
+            # window, so the retry must drop thinking *and* re-clamp max_tokens.
+            # Each self-heal below is idempotent (guarded so it fires at most
+            # once per request), so they can stack across up to three attempts.
+            retry_force: Optional[int] = None   # pin max_tokens (context-fit)
+            drop_thinking = False               # strip the thinking field
+            drop_output_config = False          # strip the output_config field
+            seen: set[str] = set()              # which self-heals already applied
+            for attempt in (1, 2, 3):
                 rewritten, changes = apply_rewrites(
                     orig_body, cfg, force_max_tokens=retry_force,
-                    drop_thinking=drop_thinking)
+                    drop_thinking=drop_thinking,
+                    drop_output_config=drop_output_config)
                 for c in changes:
                     print(f"[shim {cfg.listen_port}] rewrite: {c}", flush=True)
                 # log the model field (helps debug which model reached upstream)
@@ -661,21 +687,23 @@ def make_handler(cfg: ShimConfig):
                     return
                 # outcome == ("http", code, raw)
                 code, raw = outcome[1], outcome[2]
-                if attempt == 1:
-                    # --- Self-heal (hermes-style), two distinct error forms ---
-                    # 1) CONTEXT-WINDOW: "…exceeds the model's maximum context
-                    #    length of W tokens. You requested a total of T tokens:
-                    #    I tokens from the input messages…" → the prompt plus
-                    #    our max_tokens overflowed the TOTAL window. Retry with
-                    #    max_tokens = W - I - reserve (the server's EXACT input
-                    #    count), and persist the window so future turns clamp
-                    #    proactively. This is the sglang/vLLM case that broke
-                    #    spark (max_model_len is input+output, not the cap).
+                healed = False
+                # 1) CONTEXT-WINDOW: "…exceeds the model's maximum context
+                #    length of W tokens. You requested a total of T tokens:
+                #    I tokens from the input messages…" → the prompt plus
+                #    max_tokens overflowed the TOTAL window. Retry with
+                #    max_tokens = W - I - reserve (the server's EXACT input
+                #    count), and persist the window so future turns clamp
+                #    proactively. sglang/vLLM's max_model_len is input+output,
+                #    not an output cap — so dsh's own max_tokens (window minus
+                #    its input *estimate*) can still overflow the real window.
+                if "context" not in seen:
                     window, in_tok, _total = _parse_context_error(raw)
                     if window is not None:
+                        seen.add("context")
                         if in_tok is None:
                             in_tok = _estimate_input_tokens(
-                                json.loads(rewritten).get("messages"))
+                                json.loads(rewritten))
                         retry_force = max(1, window - in_tok - 128)
                         if not cfg.context_window or cfg.context_window != window:
                             cfg.context_window = window
@@ -684,33 +712,58 @@ def make_handler(cfg: ShimConfig):
                               f"max_tokens={retry_force}", flush=True)
                         _persist_provider_cap(cfg.provider_name, cfg.token_cap,
                                               window)
-                        continue
-                    # 2) OUTPUT-CAP: "…at most N completion tokens" / "max_tokens
-                    #    is too large" → lower the output cap and retry.
+                        healed = True
+                # 2) OUTPUT-CAP: "…at most N completion tokens" / "max_tokens
+                #    is too large" → lower the output cap and retry.
+                if not healed and "cap" not in seen:
                     cap = _parse_error_cap(raw)
                     if cap is not None and cap < cfg.token_cap:
+                        seen.add("cap")
                         old = cfg.token_cap
                         cfg.token_cap = max(cap, 256)
                         print(f"[shim {cfg.listen_port}] self-heal: output cap "
                               f"{old}->{cfg.token_cap} (upstream reports max {cap})",
                               flush=True)
                         _persist_provider_cap(cfg.provider_name, cfg.token_cap)
-                        continue
-                    # 3) EXTENDED-THINKING: upstream rejects the ``thinking``
-                    #    field (budget required / no reasoning parser). The
-                    #    model still answers a plain message — only the
-                    #    reasoning trace is lost. Strip the field and retry once.
+                        healed = True
+                # 3) EXTENDED-THINKING: upstream rejects the ``thinking`` field
+                #    (budget required / no reasoning parser). The model still
+                #    answers a plain message — only the reasoning trace is lost.
+                #    Strip the field and retry.
+                if not healed and "thinking" not in seen:
                     if _is_thinking_error(raw):
                         try:
                             _had_thinking = "thinking" in json.loads(rewritten)
                         except (ValueError, UnicodeDecodeError):
                             _had_thinking = False
                         if _had_thinking:
+                            seen.add("thinking")
                             drop_thinking = True
                             print(f"[shim {cfg.listen_port}] self-heal: upstream "
                                   "rejected extended thinking -> retry without "
                                   "the thinking field", flush=True)
-                            continue
+                            healed = True
+                # 4) OPAQUE 500 + nonstandard output_config field: one backend
+                #    returns an opaque "Internal server error" whenever the
+                #    request carries output_config (a field dsh's pi-ai layer
+                #    adds). Drop it and retry. Only fires on a 500 AND only if
+                #    the field is actually in the request, so a genuine 500
+                #    without the field is NOT masked.
+                if not healed and "output_config" not in seen:
+                    if code == 500:
+                        try:
+                            _had_oc = "output_config" in json.loads(rewritten)
+                        except (ValueError, UnicodeDecodeError):
+                            _had_oc = False
+                        if _had_oc:
+                            seen.add("output_config")
+                            drop_output_config = True
+                            print(f"[shim {cfg.listen_port}] self-heal: upstream "
+                                  "500'd with output_config present -> retry "
+                                  "without the output_config field", flush=True)
+                            healed = True
+                if healed:
+                    continue
                 self._send_error(code, raw)
                 return
 

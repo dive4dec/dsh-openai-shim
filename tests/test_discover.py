@@ -345,6 +345,38 @@ def test_clamp_uses_window_minus_input():
     assert json.loads(out2)["max_tokens"] == 50000  # 50000 < cap, small input → kept
 
 
+def test_estimator_counts_full_input_not_just_messages():
+    """Regression: the input estimate must include ``system`` + ``tools``.
+
+    dsh sends ~24 tool definitions (thousands of tokens); counting only
+    ``messages`` made the proactive max_tokens clamp too generous and overflowed
+    small-window backends (spark). The estimate must reflect the FULL input so
+    the first request already fits.
+    """
+    from dsh_openai_shim import _estimate_input_tokens, ShimConfig, apply_rewrites
+    import json as _j
+    # a big system prompt + tools, but a TINY message
+    big_system = "You are a helpful harness. " * 200   # ~5800 chars
+    tools = [{"name": f"tool{i}", "description": "d " * 300} for i in range(24)]
+    data = _j.dumps({
+        "model": "m", "max_tokens": 60000,
+        "system": big_system,
+        "tools": tools,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    cfg = ShimConfig(upstream="http://u/v1", listen_port=1,
+                     effort_mode="off", token_cap=64000, context_window=64000)
+    out, _ = apply_rewrites(data.encode(), cfg)
+    got = _j.loads(out)["max_tokens"]
+    # full input is ~ (5800 + ~24*1200 + tiny) / 4 ≈ 8000+ tokens → clamp must
+    # lower max_tokens well below the 60000 request.
+    assert got < 60000, f"full-input estimator failed to lower max_tokens (got {got})"
+    # and it must leave real headroom: max_tokens must be ≤ window − est
+    est = _estimate_input_tokens(_j.loads(data))
+    assert est > 4000, f"expected full-input estimate to be large, got {est}"
+    assert got <= 64000 - est
+
+
 def test_self_heal_context_window_retries_and_fits(tmp_path, monkeypatch, capsys):
     """End-to-end: sglang's context-length 400 → shim reads the EXACT input
     count, retries once with max_tokens = window − input − reserve → 200."""
