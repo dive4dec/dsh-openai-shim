@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 
 __all__ = ["__version__", "ShimConfig", "apply_rewrites", "make_handler", "serve",
            "ensure_shim", "shim_base_url", "is_shim_running", "DEFAULT_SHIM_PORT"]
@@ -398,12 +398,14 @@ class _SSEMessageStartDedup:
         """True if this SSE event is a ``message_start``.
 
         Match the ``event: message_start`` LINE anywhere in the event, NOT
-        position 0: the upstream is ``Transfer-Encoding: chunked`` and the shim
-        reads the raw wire (``resp.fp.read1``), so the FIRST event arrives with a
-        hex chunk-size line glued to its front (``2be\\r\\nevent: message_start…``)
-        and does NOT begin with ``event:``. (dsh's SSE parser ignores that bare
-        hex line — it's not an ``event:/data:`` field — so the stream still
-        works; we only need to *recognize* the start for dedup.)"""
+        position 0: dsh 0.2.0-rc.1's HTTP stack can deliver a stream whose
+        FIRST bytes carry a framing artifact glued in front of the first
+        event (e.g. a leftover chunk-size line when the response was not
+        fully de-chunked by an intermediate hop), so the first event may
+        NOT begin with ``event:``. dsh's SSE parser ignores that bare
+        non-field line, so the stream still works — we only need to
+        *recognize* the start for dedup.
+        """
         for line in event.split(b"\n"):
             if line.strip() == b"event: message_start":
                 return True
@@ -497,13 +499,22 @@ def make_handler(cfg: ShimConfig):
             we emit a terminal SSE event and close cleanly. The client sees a
             clean end to the stream instead of a raw connection close.
 
-            The body is forwarded with ``resp.fp.read1(4096)``: that does ONE
-            underlying socket read and returns as soon as ANY data is available
+            The body is forwarded with ``resp.read1(4096)``: that does ONE
+            de-chunked read and returns as soon as ANY data is available
             (it does NOT wait to fill 4096). ``resp.read(4096)`` would instead
             block until the buffer is full, batching the whole generation and
             only delivering it at the end — which defeats live streaming. A
             bounded per-read flush also keeps a stalling client from wedging
             the upstream socket buffer.
+
+            NOTE: this MUST be ``resp.read1`` (HTTPResponse), NOT
+            ``resp.fp.read1`` (the raw socket). The upstream is
+            ``Transfer-Encoding: chunked``; ``resp.fp`` bypasses
+            de-chunking and leaks the hex chunk-size markers into the SSE
+            byte stream. dsh's SSE parser only tolerates a marker that lands
+            on a standalone line — when a ``data:`` JSON payload straddles a
+            chunk boundary the marker lands mid-JSON and the stream fails
+            with ``DeepSeek Messages SSE contains invalid JSON``.
             """
             self.send_response(resp.status)
             for k, v in resp.headers.items():
@@ -545,7 +556,7 @@ def make_handler(cfg: ShimConfig):
             try:
                 while True:
                     try:
-                        chunk = resp.fp.read1(4096)
+                        chunk = resp.read1(4096)
                     except http.client.IncompleteRead as ir:
                         # Upstream severed the stream mid-body (declared more
                         # data than it actually sent). Forward whatever it

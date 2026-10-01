@@ -323,6 +323,10 @@ def _make_fake_sse_upstream(port):
     Three behaviours by request path:
       * /sse — 200, no framing, drips SSE events with a 50ms gap (liveness is
         measurable) then a clean close (EOF).
+      * /sse-chunked — 200, Transfer-Encoding: chunked, the SSE events delivered
+        as HTTP chunks (this is how LiteLLM actually serves SSE), then a clean
+        close. Used to prove the shim de-chunks and does NOT leak hex chunk-size
+        markers into the forwarded stream.
       * /cut — 200, no framing, one SSE event, then SO_LINGER(1,0) → a TCP RST
         mid-stream. This is the REAL production cut signature: the shim's
         read1 raises ConnectionResetError.
@@ -367,6 +371,20 @@ def _make_fake_sse_upstream(port):
                 for ev in _sse_lines(8):
                     c.sendall(ev)
                     time.sleep(0.05)
+                c.close()
+                return
+            if path == "/sse-chunked":
+                # 200 + Transfer-Encoding: chunked, SSE delivered as HTTP chunks
+                # (the real LiteLLM shape). urllib de-chunks resp.read1(); the
+                # OLD resp.fp.read1(4096) forwarded these hex size lines into
+                # the stream -> dsh "SSE contains invalid JSON".
+                c.sendall(b"HTTP/1.1 200 OK\r\n"
+                          b"Content-Type: text/event-stream\r\n"
+                          b"Transfer-Encoding: chunked\r\n\r\n")
+                for ev in _sse_lines(8):
+                    c.sendall(("%x\r\n" % len(ev)).encode() + ev + b"\r\n")
+                    time.sleep(0.05)
+                c.sendall(b"0\r\n\r\n")
                 c.close()
                 return
             resp = json.dumps({"id": "x", "object": "chat.completion",
@@ -464,6 +482,40 @@ def test_sse_passthrough_streams_live():
         # 8 events @ 50ms = ~0.4s upstream; a live first byte must land well
         # before the stream finishes (buffered would land at ~0.4s+).
         assert first is not None and first < 0.25
+    finally:
+        httpd.server_close()
+        up.stop()
+
+
+def test_sse_chunked_upstream_dechunks_no_markers():
+    """Upstream serves SSE as Transfer-Encoding: chunked (the real LiteLLM
+    shape). The shim MUST de-chunk: the bytes the client receives contain
+    every SSE event verbatim and NO hex chunk-size marker lines. The old
+    resp.fp.read1(4096) leaked those markers into the stream, and when a
+    data: JSON payload straddled a chunk boundary dsh aborted with
+    "DeepSeek Messages SSE contains invalid JSON".
+    """
+    up_port = _free_port()
+    up = _make_fake_sse_upstream(up_port)
+    httpd, base, _port = _inproc_shim(f"http://127.0.0.1:{up_port}")
+    try:
+        body = json.dumps({"model": "Socrates", "stream": True,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        data, _first, status = _stream_request(base, "/sse-chunked", body, 10)
+        assert status == 200
+        assert b"tok1" in data            # first event present, intact
+        assert b"tok8" in data            # last event present
+        assert b"[DONE]" in data          # terminal marker
+        # every data: JSON event must parse ([DONE] is the terminal marker,
+        # not JSON — skip it)
+        for line in data.split(b"\n"):
+            if line.startswith(b"data:") and line.strip() != b"data: [DONE]":
+                json.loads(line[5:])
+        # THE POINT: no leaked chunk-size marker (a line of pure hex).
+        for line in data.replace(b"\r", b"").split(b"\n"):
+            s = line.strip()
+            assert not (s and all(c in b"0123456789abcdef" for c in s)), \
+                f"leaked chunk marker: {line!r}"
     finally:
         httpd.server_close()
         up.stop()

@@ -3,6 +3,22 @@
 All notable changes to the `dsh-openai-shim` package are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.6] — 2026-10-01
+
+### Fixed
+- **SSE chunk-size markers leaking into the streamed body →
+  `DeepSeek Messages SSE contains invalid JSON`.** The stream-forwarder read
+  the upstream body with `resp.fp.read1(4096)` — the *raw socket* — which
+  bypasses Python's chunked-encoding de-chunking. The upstream (LiteLLM)
+  serves `Transfer-Encoding: chunked`, so the hex chunk-size markers
+  (`2be\r\n`, `85\r\n`, …) were forwarded into the SSE byte stream. dsh's SSE
+  parser only tolerates a marker that lands on a standalone line; when a
+  `data:` JSON payload straddles a chunk boundary the marker lands mid-JSON
+  and the stream aborts with "SSE contains invalid JSON". Fixed by reading
+  `resp.read1(4096)` (HTTPResponse) instead: it de-chunks but still returns a
+  buffer as soon as any data is available, so live token-by-token streaming
+  is preserved.
+
 ## [0.2.5] — 2026-09-29
 
 ### Fixed
