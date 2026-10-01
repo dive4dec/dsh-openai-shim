@@ -949,3 +949,162 @@ def test_end_to_end_stacked_self_heal_thinking_then_output_config():
             shttpd.server_close()
     finally:
         httpd.server_close()
+
+
+# ─────────────────────────────────────────────────────────────
+# /v1/models context-window enrichment (field-name bridge for dsh)
+# ─────────────────────────────────────────────────────────────
+
+def test_enrich_sglang_max_model_len():
+    from dsh_openai_shim import enrich_models_body
+    raw = json.dumps({
+        "object": "list",
+        "data": [{"id": "Socrates", "object": "model", "owned_by": "sglang",
+                  "max_model_len": 64000}],
+    }).encode()
+    out = enrich_models_body(raw)
+    assert out is not None
+    d = json.loads(out)
+    m = d["data"][0]
+    # The field dsh DOES read now carries the real limit…
+    assert m["context_window"] == 64000
+    # …and the original upstream field is preserved (never stripped).
+    assert m["max_model_len"] == 64000
+
+
+def test_enrich_litellm_max_input_tokens():
+    from dsh_openai_shim import enrich_models_body
+    raw = json.dumps({
+        "data": [{"id": "socratic", "max_input_tokens": 64000,
+                  "max_output_tokens": 8192}],
+    }).encode()
+    out = enrich_models_body(raw)
+    d = json.loads(out)
+    # No explicit context-window field -> the input cap is the usable window.
+    assert d["data"][0]["context_window"] == 64000
+
+
+def test_enrich_does_not_clobber_existing_context_window():
+    from dsh_openai_shim import enrich_models_body
+    raw = json.dumps({"data": [{"id": "m", "max_model_len": 64000,
+                                "context_window": 32000}]}).encode()
+    out = enrich_models_body(raw)
+    # An explicit context_window wins; we never overwrite the caller's value.
+    assert out is None  # unchanged -> caller forwards original bytes
+
+
+def test_enrich_no_window_field_returns_none():
+    from dsh_openai_shim import enrich_models_body
+    raw = json.dumps({"data": [{"id": "Socrates", "object": "model"}]}).encode()
+    assert enrich_models_body(raw) is None
+
+
+def test_enrich_non_json_and_non_models_passthrough():
+    from dsh_openai_shim import enrich_models_body
+    assert enrich_models_body(b"not json") is None
+    assert enrich_models_body(b"[1,2,3]") is None          # JSON but not object
+    assert enrich_models_body(json.dumps({"foo": 1}).encode()) is None  # no data[]
+    assert enrich_models_body(None) is None
+    assert enrich_models_body(b"") is None
+
+
+def test_enrich_multiple_models_all_enriched():
+    from dsh_openai_shim import enrich_models_body
+    raw = json.dumps({"data": [
+        {"id": "a", "max_model_len": 64000},
+        {"id": "b", "max_model_len": 128000},
+        {"id": "c"},  # no window -> left alone
+    ]}).encode()
+    out = json.loads(enrich_models_body(raw))
+    assert out["data"][0]["context_window"] == 64000
+    assert out["data"][1]["context_window"] == 128000
+    assert "context_window" not in out["data"][2]
+
+
+def test_end_to_end_models_enriched_through_shim():
+    """Full path: a SGLang-style upstream (max_model_len) -> shim -> client.
+    The client (standing in for dsh) must see context_window on the model."""
+    import urllib.request
+    up_port = _free_port()
+    shim_port = _free_port()
+
+    sglang_models = {
+        "object": "list",
+        "data": [{"id": "Socrates", "object": "model",
+                  "owned_by": "sglang", "max_model_len": 64000}],
+    }
+    H = _models_upstream(sglang_models, up_port)
+    httpd = H.server
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        cfg = ShimConfig(upstream=f"http://127.0.0.1:{up_port}/v1",
+                         listen_port=shim_port, effort_mode="off",
+                         token_cap=100000)
+        from http.server import ThreadingHTTPServer
+        Handler, _ = make_handler(cfg)
+        shttpd = ThreadingHTTPServer(("127.0.0.1", shim_port), Handler)
+        threading.Thread(target=shttpd.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{shim_port}/v1/models", timeout=20) as r:
+                assert r.status == 200
+                out = json.loads(r.read())
+            m = out["data"][0]
+            assert m["context_window"] == 64000   # dsh now reads this
+            assert m["max_model_len"] == 64000    # original preserved
+        finally:
+            shttpd.server_close()
+    finally:
+        httpd.server_close()
+
+
+def test_end_to_end_models_no_window_passes_through():
+    """An upstream that reports no window must come back byte-equivalent
+    (no fabricated context_window)."""
+    import urllib.request
+    up_port = _free_port()
+    shim_port = _free_port()
+    H = _models_upstream({"object": "list", "data": [{"id": "Socrates"}]}, up_port)
+    httpd = H.server
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        cfg = ShimConfig(upstream=f"http://127.0.0.1:{up_port}/v1",
+                         listen_port=shim_port, effort_mode="off",
+                         token_cap=100000)
+        from http.server import ThreadingHTTPServer
+        Handler, _ = make_handler(cfg)
+        shttpd = ThreadingHTTPServer(("127.0.0.1", shim_port), Handler)
+        threading.Thread(target=shttpd.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{shim_port}/v1/models", timeout=20) as r:
+                out = json.loads(r.read())
+            assert "context_window" not in out["data"][0]
+        finally:
+            shttpd.server_close()
+    finally:
+        httpd.server_close()
+
+
+def _models_upstream(payload: dict, port: int):
+    """A minimal upstream that serves ``payload`` on any GET (its /v1/models)."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            resp = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+    H.server = httpd
+    return H
+

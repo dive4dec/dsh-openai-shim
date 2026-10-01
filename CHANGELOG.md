@@ -3,6 +3,28 @@
 All notable changes to the `dsh-openai-shim` package are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.7] — 2026-10-01
+
+### Added
+- **Proactive context-window detection via `GET /v1/models` enrichment
+  (hermes-style).** SGLang/vLLM report a model's context window as
+  `max_model_len` — a field dsh's own deduce does **not** read (it only looks
+  at `contextWindow` / `context_window` / `context_length` / `max_input_tokens`
+  / `limit.context`). So against such an endpoint dsh couldn't read the real
+  limit and silently fell back to a hardcoded `65536` default, then the first
+  long turn 400'd with "…exceeds the model's maximum context length of 64000
+  tokens". The shim is the one hop every provider goes through, so it now
+  intercepts `GET /v1/models` and, for each model that reports a window under
+  any hermes-recognised name but not `context_window`, copies that value into
+  `context_window` — a field dsh DOES read. The original upstream field is
+  preserved (never stripped), and a body that reports no window is forwarded
+  byte-for-byte unchanged. This makes dsh resolve the real window **before the
+  first request**, complementing (not replacing) the existing self-heal that
+  learns the same number from a first context-length 400.
+- Tests: pure `enrich_models_body` coverage (SGLang `max_model_len`, LiteLLM
+  `max_input_tokens`, no-clobber, no-window passthrough, non-JSON, multi-model)
+  plus two full end-to-end tests through a real handler + fake upstream.
+
 ## [0.2.6] — 2026-10-01
 
 ### Fixed

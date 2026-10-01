@@ -6,6 +6,9 @@ forwarding requests while applying two safe rewrites:
 
   * ``reasoning_effort``  — remap to a supported value or drop it
   * ``max_tokens``        — clamp so input+output stays under the context cap
+  * ``GET /v1/models``    — expose each model's context window under
+                           ``context_window`` so the client's own context
+                           detection reads the upstream's real limit
 
 No third-party dependencies. Importable for unit testing; runnable standalone.
 """
@@ -20,7 +23,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 __all__ = ["__version__", "ShimConfig", "apply_rewrites", "make_handler", "serve",
            "ensure_shim", "shim_base_url", "is_shim_running", "DEFAULT_SHIM_PORT"]
@@ -150,6 +153,55 @@ def apply_rewrites(body: Optional[bytes], cfg: ShimConfig,
     if not changes:
         return body, changes
     return (json.dumps(data).encode("utf-8"), changes)
+
+
+def enrich_models_body(raw: Optional[bytes]) -> Optional[bytes]:
+    """Rewrite a ``GET /v1/models`` body so the client's own context-window
+    detection reads the upstream's REAL limit.
+
+    OpenAI-compatible clients (dsh / DeepSeek Harness, hermes) discover a
+    model's context window from ``/v1/models`` by a fixed set of field names.
+    SGLang/vLLM report it as ``max_model_len`` — which dsh's field list does
+    NOT include — so dsh can't read it and silently falls back to a hardcoded
+    default (65536), even though the server's real window is smaller (e.g.
+    64000). The first long turn then 400s: "…exceeds the model's maximum
+    context length of 64000 tokens".
+
+    We close that gap at the shim — the one hop EVERY provider goes through:
+    for each model in ``data[]`` that reports a context-window field (under any
+    name hermes-style discovery recognises) but not ``context_window`` (a field
+    dsh DOES read), copy the discovered value into ``context_window``.
+
+    Pure and idempotent: adds ``context_window`` once and never overwrites an
+    existing one. Non-JSON, non-object, or non-``data``-list bodies, and bodies
+    where no window field is discoverable, are returned unchanged (``None``) so
+    the caller forwards the original bytes verbatim.
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    models = data.get("data")
+    if not isinstance(models, list):
+        return None
+
+    from .discover import _CONTEXT_KEYS, _cap, _extract_first_int
+
+    changed = False
+    for m in models:
+        if not isinstance(m, dict) or "context_window" in m:
+            continue  # absent -> nothing to add; present -> never clobber
+        win = _cap(_extract_first_int(m, _CONTEXT_KEYS))
+        if win is not None:
+            m["context_window"] = win
+            changed = True
+    if not changed:
+        return None
+    return json.dumps(data).encode("utf-8")
 
 
 def _estimate_input_tokens(data) -> int:
@@ -631,7 +683,57 @@ def make_handler(cfg: ShimConfig):
             self._send_success(resp, raw)
             return None
 
+        def _forward_models(self, method: str) -> None:
+            """Handle ``GET /v1/models``: forward, but enrich the body so the
+            client's context-window detection reads the upstream's REAL limit.
+
+            The shim is the one hop every provider goes through, so this is the
+            single place to bridge the field-name gap: SGLang/vLLM report the
+            window as ``max_model_len`` (which dsh's detector doesn't read), so
+            dsh would otherwise fall back to a hardcoded default. We copy the
+            discovered window into ``context_window`` — a field dsh DOES read.
+
+            Only the ``/models`` path is enriched (matched on the request
+            path); anything else is forwarded verbatim. On a non-enrichable body
+            (no window field, or not a models payload) the original bytes are
+            forwarded unchanged, so this is a no-op for non-models / no-window
+            upstreams.
+            """
+            url = cfg.upstream + self.path
+            headers = _filter_headers(self.headers, _STRIP_REQ_HEADERS)
+            if cfg.upstream_key:
+                headers["Authorization"] = f"Bearer {cfg.upstream_key}"
+            req = urllib.request.Request(url, headers=headers, method=method)
+            try:
+                resp = urllib.request.urlopen(req, timeout=cfg.timeout)
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                print(f"[shim {cfg.listen_port}] upstream HTTP {e.code}: {raw[:200]!r}",
+                      flush=True)
+                self._send_error(e.code, raw)
+                return
+            except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+                self._send_502(str(e))
+                return
+            try:
+                raw = resp.read()
+            except (http.client.IncompleteRead, urllib.error.URLError,
+                    socket.timeout, ConnectionError, OSError) as e:
+                print(f"[shim {cfg.listen_port}] models read failed: {e}", flush=True)
+                self._send_502(str(e))
+                return
+            enriched = enrich_models_body(raw)
+            out = enriched if enriched is not None else raw
+            self._send_success(resp, out)
+
         def _forward(self, method: str, body: Optional[bytes]) -> None:
+            # GET /v1/models is special: enrich the model list so the client's
+            # context-window detection reads the upstream's real limit (the
+            # field-name bridge described in _forward_models). Anything else
+            # falls through to the normal forward path.
+            if method in ("GET", "HEAD") and self.path.rsplit("?", 1)[0].rstrip("/").endswith("/models"):
+                self._forward_models(method)
+                return
             url = cfg.upstream + self.path
             headers = _filter_headers(self.headers, _STRIP_REQ_HEADERS)
             if cfg.upstream_key:
